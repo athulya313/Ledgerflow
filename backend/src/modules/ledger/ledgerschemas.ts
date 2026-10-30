@@ -4,6 +4,8 @@ import { z } from "zod";
 export const createLedgerTransactionSchema = z.object({
   description: z.string().trim().min(3).max(500),
 
+  reference: z.string().trim().min(1).max(255).optional(),
+
   entries: z
     .array(
       z.object({

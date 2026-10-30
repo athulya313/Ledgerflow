@@ -15,6 +15,8 @@ import {
   getTrialBalanceController,
   createTransferController,
   reverseLedgerTransactionController,
+  getMonthlyCashFlowController,
+  
 } from "./ledgercontoller.js";
 import {
   listReconciliationsController,
@@ -59,6 +61,13 @@ router.get(
   requireOrganization,
   requireRole("owner", "finance_admin", "auditor"),
   getAccountBalancesController,
+);
+router.get(
+  "/organizations/:organizationId/ledger/monthly-cash-flow",
+  requireAuth,
+  requireOrganization,
+  requireRole("owner", "finance_admin", "auditor"),
+  getMonthlyCashFlowController,
 );
 
 router.get(

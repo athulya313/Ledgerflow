@@ -7,6 +7,7 @@ import {
   getAccountBalances,
   getTrialBalance,
   reverseLedgerTransaction,
+    getMonthlyCashFlow,
 } from "./ledgerservices.js";
 import type { AuthenticatedRequest } from "../auth/authmiddleware.js";
 import {
@@ -287,6 +288,31 @@ export async function getTrialBalanceController(
     });
   }
 }
+
+export async function getMonthlyCashFlowController(
+  req: Request,
+  res: Response,
+) {
+  const { organizationId } = req.params;
+
+  if (typeof organizationId !== "string") {
+    res.status(400).json({ message: "Invalid organization ID" });
+    return;
+  }
+
+  try {
+    const months = await getMonthlyCashFlow(organizationId);
+
+    res.status(200).json({ months });
+  } catch (error) {
+    console.error("Get monthly cash flow failed:", error);
+
+    res.status(500).json({
+      message: "Failed to generate monthly cash flow",
+    });
+  }
+}
+
 
 export async function createTransferController(
   req: AuthenticatedRequest,

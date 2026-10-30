@@ -58,28 +58,32 @@ export async function createLedgerTransaction(
 
     // Attempt to create the transaction.
     // The unique index safely handles simultaneous requests with the same key.
-    const transactionResult = await client.query(
-      `INSERT INTO ledger_transactions (
-         organization_id,
-         description,
-         status,
-         created_by,
-         idempotency_key,
-         request_hash
-       )
-       VALUES ($1, $2, 'draft', $3, $4, $5)
-       ON CONFLICT (organization_id, idempotency_key)
-         WHERE idempotency_key IS NOT NULL
-       DO NOTHING
-       RETURNING id, organization_id, description, status, created_at`,
-      [
-        organizationId,
-        data.description,
-        actorUserId,
-        idempotencyKey ?? null,
-        idempotencyKey === undefined ? null : requestHash,
-      ],
-    );
+   
+const transactionResult = await client.query(
+  `INSERT INTO ledger_transactions (
+     organization_id,
+     description,
+     reference,
+     status,
+     created_by,
+     idempotency_key,
+     request_hash
+   )
+   VALUES ($1, $2, $3, 'draft', $4, $5, $6)
+   ON CONFLICT (organization_id, idempotency_key)
+     WHERE idempotency_key IS NOT NULL
+   DO NOTHING
+   RETURNING id, organization_id, description, reference, status, created_at`,
+  [
+    organizationId,
+    data.description,
+    data.reference ?? null,
+    actorUserId,
+    idempotencyKey ?? null,
+    idempotencyKey === undefined ? null : requestHash,
+  ],
+);
+
 
     // No row means this organization already used this key.
     if (transactionResult.rows.length === 0) {
@@ -300,7 +304,17 @@ export async function listLedgerTransactions(
        status,
        created_by,
        created_at,
-       posted_at
+       posted_at,
+       COALESCE(
+         (
+           SELECT SUM(le.amount_paise)::text
+           FROM ledger_entries le
+           WHERE le.organization_id = ledger_transactions.organization_id
+             AND le.transaction_id = ledger_transactions.id
+             AND le.entry_type = 'debit'
+         ),
+         '0'
+       ) AS amount_paise
      FROM ledger_transactions
      WHERE ${whereClause}
      ORDER BY posted_at DESC, id DESC
@@ -508,6 +522,74 @@ export async function getTrialBalance(
     isBalanced: totalDebits === totalCredits,
   };
 }
+
+export async function getMonthlyCashFlow(
+  organizationId: string,
+  db: LedgerQuery = pool,
+) {
+  const result = await db.query(
+    `WITH months AS (
+       SELECT generate_series(
+         date_trunc('month', CURRENT_DATE) - INTERVAL '5 months',
+         date_trunc('month', CURRENT_DATE),
+         INTERVAL '1 month'
+       )::date AS month_start
+     ),
+     monthly_totals AS (
+       SELECT
+         date_trunc('month', lt.posted_at)::date AS month_start,
+         SUM(
+           CASE
+             WHEN a.account_type = 'income'
+               AND le.entry_type = 'credit'
+               THEN le.amount_paise
+             WHEN a.account_type = 'income'
+               AND le.entry_type = 'debit'
+               THEN -le.amount_paise
+             ELSE 0
+           END
+         ) AS income_paise,
+         SUM(
+           CASE
+             WHEN a.account_type = 'expense'
+               AND le.entry_type = 'debit'
+               THEN le.amount_paise
+             WHEN a.account_type = 'expense'
+               AND le.entry_type = 'credit'
+               THEN -le.amount_paise
+             ELSE 0
+           END
+         ) AS expenses_paise
+       FROM ledger_entries le
+       JOIN ledger_transactions lt
+         ON lt.id = le.transaction_id
+         AND lt.organization_id = le.organization_id
+       JOIN accounts a
+         ON a.id = le.account_id
+         AND a.organization_id = le.organization_id
+       WHERE le.organization_id = $1
+         AND lt.status = 'posted'
+         AND lt.posted_at >=
+           date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+         AND lt.posted_at <
+           date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+         AND a.account_type IN ('income', 'expense')
+       GROUP BY date_trunc('month', lt.posted_at)::date
+     )
+     SELECT
+       to_char(m.month_start, 'YYYY-MM') AS month,
+       COALESCE(mt.income_paise, 0)::text AS income_paise,
+       COALESCE(mt.expenses_paise, 0)::text AS expenses_paise
+     FROM months m
+     LEFT JOIN monthly_totals mt
+       ON mt.month_start = m.month_start
+     ORDER BY m.month_start ASC`,
+    [organizationId],
+  );
+
+  return result.rows;
+}
+
 
 export async function reverseLedgerTransaction(
   organizationId: string,
