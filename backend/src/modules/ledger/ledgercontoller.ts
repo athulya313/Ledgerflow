@@ -51,7 +51,14 @@ export async function createLedgerTransactionController(
         : "Ledger transaction created and posted successfully",
       transaction,
     });
-  } catch (error) {
+} catch (error) {
+    if (error instanceof AppError) {
+      res.status(error.statusCode).json({
+        message: error.message,
+      });
+      return;
+    }
+
     if (error instanceof ZodError) {
       res.status(400).json({
         message: "Invalid transaction data",
@@ -313,7 +320,6 @@ export async function getMonthlyCashFlowController(
   }
 }
 
-
 export async function createTransferController(
   req: AuthenticatedRequest,
   res: Response,
@@ -364,6 +370,15 @@ export async function createTransferController(
       transaction,
     });
   } catch (error) {
+    // Handle application errors with their intended HTTP status.
+    if (error instanceof AppError) {
+      res.status(error.statusCode).json({
+        message: error.message,
+      });
+      return;
+    }
+
+    // Handle request validation errors.
     if (error instanceof ZodError) {
       res.status(400).json({
         message: "Invalid transfer data",
@@ -372,6 +387,7 @@ export async function createTransferController(
       return;
     }
 
+    // Handle known business errors.
     if (error instanceof Error) {
       const badRequestErrors = [
         "Ledger transaction must have equal debit and credit totals",
@@ -397,6 +413,7 @@ export async function createTransferController(
       }
     }
 
+    // Handle database constraint violations.
     const databaseError = error as { code?: string };
 
     if (databaseError?.code === "23514") {
@@ -406,6 +423,7 @@ export async function createTransferController(
       return;
     }
 
+    // Handle unexpected errors.
     console.error("Create transfer failed:", error);
 
     res.status(500).json({

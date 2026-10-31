@@ -1,8 +1,11 @@
 
-import type { Request, Response } from "express";
+import type { Request, Response , NextFunction } from "express";
 import { ZodError } from "zod";
 import { AppError } from "../../middleware/apperror.js";
 import { importBankStatement } from "./reconciliationservices.js";
+import { manuallyMatchReconciliationItem } from "./reconciliationservices.js";
+
+
 
 type ReconciliationRequest = Request & {
   user?: {
@@ -76,5 +79,34 @@ export async function importBankStatementController(
     return res.status(500).json({
       message: "Failed to import bank statement",
     });
+  }
+  
+}
+export async function manuallyMatchReconciliationItemController(
+  req: ReconciliationRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    if (!req.user?.id) {
+      return res.status(401).json({
+        message: "Authentication required",
+      });
+    }
+
+    const result = await manuallyMatchReconciliationItem(
+      req.params.organizationId as string,
+      req.params.reconciliationId as string,
+      req.params.itemId as string,
+      req.body.ledgerTransactionId,
+      req.user.id,
+    );
+
+    return res.status(200).json({
+      message: "Reconciliation item matched successfully",
+      result,
+    });
+  } catch (error) {
+    next(error);
   }
 }

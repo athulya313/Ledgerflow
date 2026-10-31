@@ -6,12 +6,15 @@ import { AppError } from "../../middleware/apperror.js";
 import { createHash } from "node:crypto";
 
 type LedgerQuery = Pick<Pool | PoolClient, "query">;
+
+
+
 export async function createLedgerTransaction(
   organizationId: string,
   input: unknown,
   actorUserId: string,
   idempotencyKey?: string,
-   dbPool: Pool = pool,
+  dbPool: Pool = pool,
 ) {
   const data = createLedgerTransactionSchema.parse(input);
 
@@ -26,12 +29,12 @@ export async function createLedgerTransaction(
     );
   }
 
-  // Hash the validated request body so we can detect key reuse
-  // with different transaction data.
+  // Generate request hash for idempotency.
   const requestHash = createHash("sha256")
     .update(JSON.stringify(data))
     .digest("hex");
 
+  // Validate double-entry totals.
   const debitTotal = data.entries
     .filter((entry) => entry.entryType === "debit")
     .reduce((total, entry) => total + BigInt(entry.amountPaise), 0n);
@@ -56,36 +59,39 @@ export async function createLedgerTransaction(
   try {
     await client.query("BEGIN");
 
-    // Attempt to create the transaction.
-    // The unique index safely handles simultaneous requests with the same key.
-   
-const transactionResult = await client.query(
-  `INSERT INTO ledger_transactions (
-     organization_id,
-     description,
-     reference,
-     status,
-     created_by,
-     idempotency_key,
-     request_hash
-   )
-   VALUES ($1, $2, $3, 'draft', $4, $5, $6)
-   ON CONFLICT (organization_id, idempotency_key)
-     WHERE idempotency_key IS NOT NULL
-   DO NOTHING
-   RETURNING id, organization_id, description, reference, status, created_at`,
-  [
-    organizationId,
-    data.description,
-    data.reference ?? null,
-    actorUserId,
-    idempotencyKey ?? null,
-    idempotencyKey === undefined ? null : requestHash,
-  ],
-);
+    // Create the transaction.
+    const transactionResult = await client.query(
+      `INSERT INTO ledger_transactions (
+         organization_id,
+         description,
+         reference,
+         status,
+         created_by,
+         idempotency_key,
+         request_hash
+       )
+       VALUES ($1, $2, $3, 'draft', $4, $5, $6)
+       ON CONFLICT (organization_id, idempotency_key)
+         WHERE idempotency_key IS NOT NULL
+       DO NOTHING
+       RETURNING
+         id,
+         organization_id,
+         description,
+         reference,
+         status,
+         created_at`,
+      [
+        organizationId,
+        data.description,
+        data.reference ?? null,
+        actorUserId,
+        idempotencyKey ?? null,
+        idempotencyKey === undefined ? null : requestHash,
+      ],
+    );
 
-
-    // No row means this organization already used this key.
+    // Handle an existing idempotency key.
     if (transactionResult.rows.length === 0) {
       const existingResult = await client.query(
         `SELECT id, request_hash
@@ -111,7 +117,6 @@ const transactionResult = await client.query(
         );
       }
 
-      // Return the original posted transaction and entries.
       const existingTransaction = await getLedgerTransaction(
         organizationId,
         existing.id,
@@ -135,18 +140,22 @@ const transactionResult = await client.query(
 
     const transaction = transactionResult.rows[0];
 
-    // Confirm every account is active and belongs to this organization.
+    // Collect unique account IDs.
     const accountIds = [
       ...new Set(data.entries.map((entry) => entry.accountId)),
     ];
 
+    // Lock affected accounts in a consistent order.
+    // This prevents concurrent transactions from spending
+    // the same available balance.
     const accountResult = await client.query(
-      `SELECT id
+      `SELECT id, name, account_type
        FROM accounts
        WHERE organization_id = $1
          AND id = ANY($2::uuid[])
          AND status = 'active'
-       FOR SHARE`,
+       ORDER BY id
+       FOR UPDATE`,
       [organizationId, accountIds],
     );
 
@@ -157,7 +166,89 @@ const transactionResult = await client.query(
       );
     }
 
-    // Insert every debit and credit entry.
+    // Retrieve current posted balances for affected accounts.
+    // Debit increases an asset balance; credit decreases it.
+    const balanceResult = await client.query(
+      `SELECT
+         le.account_id,
+         SUM(
+           CASE
+             WHEN le.entry_type = 'debit'
+               THEN le.amount_paise
+             ELSE -le.amount_paise
+           END
+         )::text AS balance_paise
+       FROM ledger_entries le
+       JOIN ledger_transactions lt
+         ON lt.id = le.transaction_id
+         AND lt.organization_id = le.organization_id
+       WHERE le.organization_id = $1
+         AND le.account_id = ANY($2::uuid[])
+         AND lt.status = 'posted'
+       GROUP BY le.account_id`,
+      [organizationId, accountIds],
+    );
+
+    const currentBalances = new Map<string, bigint>();
+
+    for (const row of balanceResult.rows) {
+      currentBalances.set(
+        row.account_id,
+        BigInt(row.balance_paise),
+      );
+    }
+
+    // Calculate the proposed balance changes.
+    const proposedChanges = new Map<string, bigint>();
+
+    for (const entry of data.entries) {
+      const amount = BigInt(entry.amountPaise);
+
+      const change =
+        entry.entryType === "debit"
+          ? amount
+          : -amount;
+
+      proposedChanges.set(
+        entry.accountId,
+        (proposedChanges.get(entry.accountId) ?? 0n) + change,
+      );
+    }
+
+    // Format paise without losing BigInt precision.
+    const formatPaise = (amount: bigint) => {
+      const sign = amount < 0n ? "-" : "";
+      const absolute = amount < 0n ? -amount : amount;
+
+      return `${sign}${absolute / 100n}.${(absolute % 100n)
+        .toString()
+        .padStart(2, "0")}`;
+    };
+
+    // Prevent asset accounts from going below zero.
+    for (const account of accountResult.rows) {
+      if (account.account_type !== "asset") {
+        continue;
+      }
+
+      const currentBalance =
+        currentBalances.get(account.id) ?? 0n;
+
+      const proposedChange =
+        proposedChanges.get(account.id) ?? 0n;
+
+      const resultingBalance =
+        currentBalance + proposedChange;
+
+      if (resultingBalance < 0n) {
+        throw new AppError(
+          400,
+          `Insufficient balance in asset account "${account.name}". Available balance: ₹${formatPaise(currentBalance)}`,
+        );
+      }
+    }
+
+    // Insert debit and credit entries.
     for (const entry of data.entries) {
       await client.query(
         `INSERT INTO ledger_entries (
@@ -178,10 +269,11 @@ const transactionResult = await client.query(
       );
     }
 
-    // The database trigger verifies that the entries balance.
+    // Post the transaction.
     const postedResult = await client.query(
       `UPDATE ledger_transactions
-       SET status = 'posted', posted_at = NOW()
+       SET status = 'posted',
+           posted_at = NOW()
        WHERE id = $1
          AND organization_id = $2
        RETURNING
@@ -195,11 +287,20 @@ const transactionResult = await client.query(
     );
 
     if (postedResult.rows.length === 0) {
-      throw new AppError(409, "Unable to post ledger transaction");
+      throw new AppError(
+        409,
+        "Unable to post ledger transaction",
+      );
     }
 
+    // Retrieve posted entries.
     const entriesResult = await client.query(
-      `SELECT id, account_id, entry_type, amount_paise, created_at
+      `SELECT
+         id,
+         account_id,
+         entry_type,
+         amount_paise,
+         created_at
        FROM ledger_entries
        WHERE organization_id = $1
          AND transaction_id = $2
@@ -207,7 +308,7 @@ const transactionResult = await client.query(
       [organizationId, transaction.id],
     );
 
-    // Record the posting in the same database transaction.
+    // Record audit log.
     await client.query(
       `INSERT INTO audit_logs (
          organization_id,
@@ -242,7 +343,10 @@ const transactionResult = await client.query(
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Failed to roll back ledger transaction:", rollbackError);
+      console.error(
+        "Failed to roll back ledger transaction:",
+        rollbackError,
+      );
     }
 
     throw error;
@@ -250,6 +354,7 @@ const transactionResult = await client.query(
     client.release();
   }
 }
+
 
 
 export async function listLedgerTransactions(
@@ -661,6 +766,111 @@ export async function reverseLedgerTransaction(
         "The original transaction has no valid ledger entries to reverse",
       );
     }
+    
+    // Collect unique account IDs affected by the reversal.
+    const accountIds = [
+      ...new Set(
+        entriesResult.rows.map((entry) => entry.account_id),
+      ),
+    ];
+
+    // Lock affected accounts in a consistent order.
+    const accountResult = await client.query(
+      `SELECT id, name, account_type
+       FROM accounts
+       WHERE organization_id = $1
+         AND id = ANY($2::uuid[])
+         AND status = 'active'
+       ORDER BY id
+       FOR UPDATE`,
+      [organizationId, accountIds],
+    );
+
+    if (accountResult.rows.length !== accountIds.length) {
+      throw new AppError(
+        400,
+        "One or more accounts do not exist, are inactive, or are inaccessible",
+      );
+    }
+
+    // Retrieve current posted balances.
+    const balanceResult = await client.query(
+      `SELECT
+         le.account_id,
+         SUM(
+           CASE
+             WHEN le.entry_type = 'debit'
+               THEN le.amount_paise
+             ELSE -le.amount_paise
+           END
+         )::text AS balance_paise
+       FROM ledger_entries le
+       JOIN ledger_transactions lt
+         ON lt.id = le.transaction_id
+         AND lt.organization_id = le.organization_id
+       WHERE le.organization_id = $1
+         AND le.account_id = ANY($2::uuid[])
+         AND lt.status = 'posted'
+       GROUP BY le.account_id`,
+      [organizationId, accountIds],
+    );
+
+    const currentBalances = new Map<string, bigint>();
+
+    for (const row of balanceResult.rows) {
+      currentBalances.set(
+        row.account_id,
+        BigInt(row.balance_paise),
+      );
+    }
+
+    // Calculate the balance impact of reversing each entry.
+    const proposedChanges = new Map<string, bigint>();
+
+    for (const entry of entriesResult.rows) {
+      const amount = BigInt(entry.amount_paise);
+
+      // Reversal swaps debit and credit.
+      const change =
+        entry.entry_type === "debit"
+          ? -amount
+          : amount;
+
+      proposedChanges.set(
+        entry.account_id,
+        (proposedChanges.get(entry.account_id) ?? 0n) + change,
+      );
+    }
+
+    // Prevent reversal from making an asset account negative.
+    for (const account of accountResult.rows) {
+      if (account.account_type !== "asset") {
+        continue;
+      }
+
+      const currentBalance =
+        currentBalances.get(account.id) ?? 0n;
+
+      const proposedChange =
+        proposedChanges.get(account.id) ?? 0n;
+
+      if (currentBalance + proposedChange < 0n) {
+        const absolute = currentBalance < 0n
+          ? -currentBalance
+          : currentBalance;
+
+        const availableBalance =
+          `${absolute / 100n}.${(absolute % 100n)
+            .toString()
+            .padStart(2, "0")}`;
+
+        throw new AppError(
+          400,
+          `Cannot reverse transaction. Insufficient balance in asset account "${account.name}". Available balance: ₹${availableBalance}`,
+        );
+      }
+    }
+
 
     const reversalResult = await client.query(
       `INSERT INTO ledger_transactions (

@@ -453,5 +453,175 @@ export async function getReconciliationDetails(
       totalPages: Math.ceil(total / limit),
     },
   };
+  
+}
+
+
+export async function manuallyMatchReconciliationItem(
+  organizationId: string,
+  reconciliationId: string,
+  itemId: string,
+  ledgerTransactionId: string,
+  actorUserId: string,
+) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Lock the reconciliation row being reviewed.
+    const itemResult = await client.query(
+      `
+      SELECT
+        ri.id,
+        ri.transaction_date,
+        ri.amount_paise,
+        ri.status,
+        ri.ledger_transaction_id,
+        r.account_id
+      FROM reconciliation_items ri
+      JOIN reconciliations r
+        ON r.id = ri.reconciliation_id
+       AND r.organization_id = ri.organization_id
+      WHERE ri.id = $1
+        AND ri.reconciliation_id = $2
+        AND ri.organization_id = $3
+      FOR UPDATE OF ri
+      `,
+      [itemId, reconciliationId, organizationId],
+    );
+
+    if (itemResult.rowCount === 0) {
+      throw new AppError(404, "Reconciliation item not found");
+    }
+
+    const item = itemResult.rows[0];
+
+    if (item.status === "matched") {
+      throw new AppError(409, "This reconciliation item is already matched");
+    }
+
+    // Lock and validate the selected ledger transaction.
+    const transactionResult = await client.query(
+      `
+      SELECT
+        lt.id,
+        lt.posted_at
+      FROM ledger_transactions lt
+      JOIN ledger_entries le
+        ON le.transaction_id = lt.id
+       AND le.organization_id = lt.organization_id
+      WHERE lt.id = $1
+        AND lt.organization_id = $2
+        AND lt.status = 'posted'
+        AND le.account_id = $3
+        AND lt.posted_at::date = $4::date
+        AND (
+          CASE
+            WHEN le.entry_type = 'debit'
+              THEN le.amount_paise
+            ELSE -le.amount_paise
+          END
+        ) = $5::bigint
+      LIMIT 1
+      FOR UPDATE OF lt
+      `,
+      [
+        ledgerTransactionId,
+        organizationId,
+        item.account_id,
+        item.transaction_date,
+        item.amount_paise,
+      ],
+    );
+
+    if (transactionResult.rowCount === 0) {
+      throw new AppError(
+        400,
+        "Ledger transaction does not match the reconciliation row",
+      );
+    }
+
+    // Prevent assigning an already-used transaction again.
+    const existingMatch = await client.query(
+      `
+      SELECT id
+      FROM reconciliation_items
+      WHERE organization_id = $1
+        AND ledger_transaction_id = $2
+        AND id <> $3
+      LIMIT 1
+      `,
+      [organizationId, ledgerTransactionId, itemId],
+    );
+
+   
+      if ((existingMatch.rowCount ?? 0) > 0) {
+      throw new AppError(
+        409,
+        "This ledger transaction is already reconciled",
+      );
+    }
+
+    await client.query(
+      `
+      UPDATE reconciliation_items
+      SET status = 'matched',
+          ledger_transaction_id = $1
+      WHERE id = $2
+        AND organization_id = $3
+      `,
+      [ledgerTransactionId, itemId, organizationId],
+    );
+
+    await client.query(
+      `
+      UPDATE reconciliations
+      SET matched_rows = matched_rows + 1,
+          unmatched_rows = unmatched_rows - 1
+      WHERE id = $1
+        AND organization_id = $2
+      `,
+      [reconciliationId, organizationId],
+    );
+
+    await client.query(
+      `
+      INSERT INTO audit_logs (
+        organization_id,
+        actor_user_id,
+        action,
+        entity_type,
+        entity_id,
+        metadata
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [
+        organizationId,
+        actorUserId,
+        "RECONCILIATION_ITEM_MANUALLY_MATCHED",
+        "reconciliation_item",
+        itemId,
+        JSON.stringify({
+          reconciliationId,
+          ledgerTransactionId,
+        }),
+      ],
+    );
+
+    await client.query("COMMIT");
+
+    return {
+      itemId,
+      ledgerTransactionId,
+      status: "matched",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 

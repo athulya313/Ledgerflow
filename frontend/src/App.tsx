@@ -1830,7 +1830,9 @@ useEffect(() => {
                 )}
               </div>
               
-              {selectedReconciliation && (
+              {selectedReconciliation && 
+              (
+                
                 <div className="mt-6 overflow-hidden rounded-2xl border border-slate-200 bg-white">
                   <div className="flex flex-col justify-between gap-4 border-b border-slate-200 p-5 sm:flex-row sm:items-center">
                     <div>

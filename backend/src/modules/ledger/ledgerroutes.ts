@@ -6,6 +6,7 @@ import { requireRole } from "../../middleware/requirerole.js";
 import { listAuditLogsController } from "./auditlogcontroller.js";
 import multer from "multer";
 import { importBankStatementController } from "./reconciliationcontroller.js";
+import { manuallyMatchReconciliationItemController } from "./reconciliationcontroller.js";
 
 import {
   createLedgerTransactionController,
@@ -120,6 +121,13 @@ router.get(
   requireOrganization,
   requireRole("owner", "finance_admin", "auditor"),
   getReconciliationDetailsController,
+);
+router.patch(
+  "/organizations/:organizationId/reconciliations/:reconciliationId/items/:itemId/match",
+  requireAuth,
+  requireOrganization,
+  requireRole("owner", "finance_admin"),
+  manuallyMatchReconciliationItemController,
 );
 
 export default router;
